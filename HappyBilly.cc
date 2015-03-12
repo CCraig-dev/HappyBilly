@@ -20,6 +20,8 @@
 #define A_D_INPUT_GAIN_REGISTER (A_D_BASE_ADDRESS + 3)
 #define A_D_INPUT_STATUS_REGISTER (A_D_INPUT_GAIN_REGISTER)
 #define I_O_CONTROL_REGISTER (A_D_BASE_ADDRESS + 4)
+#define D_A_LSB_REGISTER (A_D_BASE_ADDRESS + 6)
+#define D_A_MSB_CHANNELNO_REGISTER (A_D_BASE_ADDRESS + 7)
 
 #define D_I_O_PORT_LENGTH (1)
 #define D_I_O_CONTROL_REGISTER (A_D_BASE_ADDRESS + 0x0b)
@@ -64,12 +66,34 @@ static short MeasureVoltageOnChannel( int channelNumber )
 	return (short)value ;
 }
 
-//static void SetupDIO()
-//{
-//	d_i_o_control_handle = mmap_device_io( D_I_O_PORT_LENGTH, D_I_O_CONTROL_REGISTER ) ;
-//	d_i_o_port_a_handle = mmap_device_io( D_I_O_PORT_LENGTH, D_I_O_PORT_A ) ;
-//	d_i_o_port_b_handle = mmap_device_io( D_I_O_PORT_LENGTH, D_I_O_PORT_B ) ;
-//}
+static void SendVoltageOnChannel( int channelNumber, int value )
+{
+	 // Range is 0-4095
+	 uint8_t  lsb_value = 0;
+	 uint8_t  msb_value = 0;
+
+	 // Put the channel into the MSB.
+	 // Bits 6 & 7 hold the DA channels 0-3
+	 msb_value = channelNumber;
+	 msb_value <<= 6;
+
+	 printf( "\n Output voltage channel number %04x\n", msb_value) ;
+
+	 // compute the value output value first.
+	 // Put the lower end of the value into the LSB.
+	 lsb_value = value & 255;
+
+     // concatinate bits 11-8 to the channel.
+	 msb_value |= (value / 256);
+
+	 printf( "\n Output msb_value %04x\n", msb_value);
+	 out8(D_A_LSB_REGISTER, lsb_value);
+	 out8(D_A_MSB_CHANNELNO_REGISTER, msb_value);
+
+	 while ( in8( A_D_INPUT_GAIN_REGISTER) & 0x08 ) ;
+
+	 printf( "\n Voltage set\n");
+}
 /*
 static void TestPorts()
 {
@@ -103,6 +127,8 @@ static void TestPorts()
 	printf( "\nDigital I O ports A and B testing completed\n" ) ;
 }
 */
+
+// This board is configured for -10 to +10 volts.
 static void SetupAtoD()
 {
 	uintptr_t i_o_control_handle ;
@@ -146,14 +172,20 @@ int main(int argc, char *argv[])
 	if ( ! GetRootAccess() )
 	{
 		SetupAtoD() ;
-//		SetupDIO() ;
+
 		printf( "\nStarting measurement on analog input line 0\n" ) ;
-		for ( loop = 0 ; loop < 16 ; loop++ )
+		for ( loop = 0 ; loop < 41 ; loop++ )
 		{
-			printf( "\n%6d", MeasureVoltageOnChannel( loop ) ) ;
+			printf( "\n%6d", MeasureVoltageOnChannel( 0 ) ) ;
+
+			// Multiply by 100 so that you see a real voltage change.
+			SendVoltageOnChannel(0, loop * 100);
+			sleep (1);
 		}
 		printf( "\n\nStarting Port A and Port B tests\n" ) ;
-//		TestPorts() ;
+
+		// set the voltage back to 0.
+		SendVoltageOnChannel(0, 0);
 	}
 	else
 		printf( "\nFailure getting root access for I/O register mapping\n") ;
