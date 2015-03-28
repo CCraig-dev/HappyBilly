@@ -17,6 +17,8 @@
 #include <hw/inout.h>     /* for in*() and out*() functions */
 #include <sys/mman.h>     /* for mmap_device_io() */
 
+#include <pthread.h>
+
 #define A_D_PORT_LENGTH (1)
 #define A_D_BASE_ADDRESS (0x280)
 #define A_D_COMMAND_REGISTER (A_D_BASE_ADDRESS)
@@ -27,6 +29,15 @@
 #define I_O_CONTROL_REGISTER (A_D_BASE_ADDRESS + 4)
 #define D_A_LSB_REGISTER (A_D_BASE_ADDRESS + 6)
 #define D_A_MSB_CHANNELNO_REGISTER (A_D_BASE_ADDRESS + 7)
+
+typedef union {
+	struct _pulse pulse;
+} my_message_t;
+
+// make pulse code for timer
+#define RTC_COMPUTE   _PULSE_CODE_MINAVAIL
+#define RTC_TERMINATE   _PULSE_CODE_MINAVAIL + 1
+#define RTC_INTERNAL_EXIT   _PULSE_CODE_MINAVAIL + 2
 
 // make static as good programming practice (not in global symbol table)
 static uintptr_t a_d_command_handle;
@@ -168,64 +179,118 @@ static void SendVoltageOnChannel(int channelNumber, double volts) {
 }
 
 int main(int argc, char *argv[]) {
-	std::cout << "Welcome to the QNX Momentics IDE" << std::endl;
 
 	double results[NUMBEROFITERATIONS];
-
 	double stepInputValueVolts = 0;
 	double prevStepInputValueVolts = 0;
 
+	int channelID = 0;
+	struct sigevent event; //Event to fire every 10ms
+	timer_t timer_id;
+	struct itimerspec itime; //Set the timer for polling (10ms)
+	my_message_t msg;
+	int rcvid;
+
+	//Worker thread for performing the parameterization of the voltage-in
+
+	//Message Channel for thread messaging
+	channelID = ChannelCreate(0);
+
+	//Event to fire every 10ms
+	event.sigev_notify = SIGEV_PULSE;
+	event.sigev_coid = ConnectAttach(ND_LOCAL_NODE, 0, channelID,
+			_NTO_SIDE_CHANNEL, 0);
+	event.sigev_priority = getprio(0);
+	event.sigev_code = RTC_COMPUTE;
+	timer_create(CLOCK_REALTIME, &event, &timer_id);
+
+	//Set the timer for polling (10ms)
+	itime.it_value.tv_sec = 0;
+	// 100 million nsecs = .1 secs
+	itime.it_value.tv_nsec = 100000000;
+	itime.it_interval.tv_sec = 0;
+	// 100 million nsecs = .1 secs
+	itime.it_interval.tv_nsec = 100000000;
+	timer_settime(timer_id, 0, &itime, NULL);
+
+	//A timer will exist to drive the register polling (10ms)
+	//The timer replaces the sleep command in this instance
+	pthread_mutex_t timimgMutex;
+	pthread_mutex_init(&timimgMutex, NULL);
+	pthread_mutex_lock(&timimgMutex);
+
 	if (!GetRootAccess()) {
+
 		SetupAtoD();
+		int k = 0;
 
-		// Step 1 Determine the time-domain difference equation for the transfer function.
-		//  y(k+1) = y(k) - 0.632y(k-1) + 0.368 u(k) + 0.264 u(k - 1)
+		while (true) {
 
-		// 2a Compute the transfer function's response to a step input of 5. Run the
-		//    simulation for 1000 sampling intervals
-		for (int k = 0; k < NUMBEROFITERATIONS; ++k) {
-			stepInputValueVolts = MeasureVoltageOnChannel(0);
-
-			// The first two iterations are special cases because we don't have
-			// any history
-			if (k == 0) {
-				// y(k+1) = 0.368 u(k);
-				results[k] = 0.368 * stepInputValueVolts;
-				prevStepInputValueVolts = stepInputValueVolts;
-			} else if (k == 1) {
-				// y(k+1) = y(k) + 0.368 u(k) + 0.264 u(k - 1);
-				results[k] = results[k - 1] + 0.368 * stepInputValueVolts
-						+ 0.264 * prevStepInputValueVolts;
-				prevStepInputValueVolts = stepInputValueVolts;
-			} else {
-				//  y(k+1) = y(k) - 0.632y(k-1) + 0.368 u(k) + 0.264 u(k - 1)
-				results[k] = results[k - 1] - 0.632 * results[k - 2] + 0.368
-						* stepInputValueVolts + 0.264 * prevStepInputValueVolts;
-				prevStepInputValueVolts = stepInputValueVolts;
+			if (k == NUMBEROFITERATIONS) {
+				MsgSendPulse(channelID, 10, _PULSE_CODE_MAXAVAIL, NULL);
+				continue;
 			}
 
-			// 3a. Run this calculation as a periodic task executing at a 10Hz period
-			usleep(100000);
+			rcvid = MsgReceive(channelID, &msg, sizeof(msg), NULL);
+			if (rcvid == 0) {
+				if (msg.pulse.code == RTC_COMPUTE) {
+					//Recompute the transfer function and modify local state
 
-			SendVoltageOnChannel(0, results[k]);
+					// Step 1 Determine the time-domain difference equation for the transfer function.
+					//  y(k+1) = y(k) - 0.632y(k-1) + 0.368 u(k) + 0.264 u(k - 1)
+
+					stepInputValueVolts = MeasureVoltageOnChannel(0);
+
+					// The first two iterations are special cases because we don't have
+					// any history
+					if (k == 0) {
+						// y(k+1) = 0.368 u(k);
+						results[k] = 0.368 * stepInputValueVolts;
+					} else if (k == 1) {
+						// y(k+1) = y(k) + 0.368 u(k) + 0.264 u(k - 1);
+						results[k] = results[k - 1] + 0.368
+								* stepInputValueVolts + 0.264
+								* prevStepInputValueVolts;
+					} else {
+						//  y(k+1) = y(k) - 0.632y(k-1) + 0.368 u(k) + 0.264 u(k - 1)
+						results[k] = results[k - 1] - 0.632 * results[k - 2]
+								+ 0.368 * stepInputValueVolts + 0.264
+								* prevStepInputValueVolts;
+					}
+					prevStepInputValueVolts = stepInputValueVolts;
+
+					// 3a. Run this calculation as a periodic task executing at a 10Hz period
+
+					SendVoltageOnChannel(0, results[k]);
+				}
+				if (msg.pulse.code == RTC_TERMINATE) {
+					//End the program
+					cout << "End the program.\n";
+
+					// 2b. Open a file in /tmp and write the output values to that file. Give the
+					//     file a .csv extension
+					ofstream outputFile;
+					outputFile.open("/tmp/example.csv");
+
+					for (int k = 0; k < NUMBEROFITERATIONS; ++k) {
+						outputFile << results[k] << ", ";
+					}
+
+					outputFile << endl;
+
+					outputFile.close();
+					exit(0);
+				}
+				if (msg.pulse.code == RTC_INTERNAL_EXIT) {
+					//Unknown, needs clarification
+					cout << "Death.\n";
+				}
+			}
+			//The number of iterations passed has increased by one
+			k++;
 		}
-
 		// set the voltage back to 0.
 		SendVoltageOnChannel(0, 0);
 	}
-
-	// 2b. Open a file in /tmp and write the output values to that file. Give the
-	//     file a .csv extension
-	ofstream outputFile;
-	outputFile.open("/tmp/example.csv");
-
-	for (int k = 0; k < NUMBEROFITERATIONS; ++k) {
-		outputFile << results[k] << ", ";
-	}
-
-	outputFile << endl;
-
-	outputFile.close();
-
 	return EXIT_SUCCESS;
 }
