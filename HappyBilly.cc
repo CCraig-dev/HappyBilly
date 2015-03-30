@@ -187,7 +187,7 @@ int main(int argc, char *argv[]) {
 	const double Kp = 1.35;
 	const double Ki = 0.06;
 	const double Kd = 0.01;
-	const double targetV = -5.0;
+	const double targetV = 5.0;
 	double errorV = 0;
 
 	int channelID = 0;
@@ -281,10 +281,9 @@ int main(int argc, char *argv[]) {
 		}
 
 		outputFile.close();
-
-		return EXIT_SUCCESS;
 		// set the voltage back to 0.
 		SendVoltageOnChannel(0, 0);
+		return EXIT_SUCCESS;
 	}
 	return EXIT_SUCCESS;
 }
