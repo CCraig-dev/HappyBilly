@@ -10,13 +10,12 @@
 #include <signal.h>
 #include <sys/siginfo.h>
 #include <sys/neutrino.h>
-#include <sys/trace.h>		// to support TraceEvent calls
+#include <sys/trace.h>	// to support TraceEvent calls
 #include <sys/netmgr.h>
 #include <sys/syspage.h>
-#include <stdint.h>       /* for uintptr_t */
-#include <hw/inout.h>     /* for in*() and out*() functions */
-#include <sys/mman.h>     /* for mmap_device_io() */
-
+#include <stdint.h> /* for uintptr_t */
+#include <hw/inout.h> /* for in*() and out*() functions */
+#include <sys/mman.h> /* for mmap_device_io() */
 #include <pthread.h>
 
 #define A_D_PORT_LENGTH (1)
@@ -35,9 +34,7 @@ typedef union {
 } my_message_t;
 
 // make pulse code for timer
-#define RTC_COMPUTE   _PULSE_CODE_MINAVAIL
-#define RTC_TERMINATE   _PULSE_CODE_MINAVAIL + 1
-#define RTC_INTERNAL_EXIT   _PULSE_CODE_MINAVAIL + 2
+#define RTC_COMPUTE _PULSE_CODE_MINAVAIL
 
 // make static as good programming practice (not in global symbol table)
 static uintptr_t a_d_command_handle;
@@ -48,7 +45,7 @@ static uintptr_t a_d_input_status_handle; // also used once for analog input gai
 
 using namespace std;
 
-#define NUMBEROFITERATIONS 1000
+#define NUMBEROFITERATIONS 200
 const double voltageRange = 20;
 
 int GetRootAccess() {
@@ -134,6 +131,12 @@ static void SendVoltageOnChannel(int channelNumber, double volts) {
 	uint8_t lsb_value = 0;
 	uint8_t msb_value = 0;
 
+	if (volts > voltageRange / 2.0) {
+		volts = voltageRange / 2.0;
+	} else if (volts < voltageRange / -2.0) {
+		volts = voltageRange / -2.0;
+	}
+
 	// convert the voltage value to the range of 0-4095.
 	// 0 = -10V and 4095 = 9.9951      // Page 59 of the Athena manual.
 
@@ -156,33 +159,36 @@ static void SendVoltageOnChannel(int channelNumber, double volts) {
 	msb_value = channelNumber;
 	msb_value <<= 6;
 
-	printf("\n Output voltage channel number %04x\n", msb_value);
-
 	// compute the value output value first.
 	// Put the lower end of the value into the LSB.
 	lsb_value = voltsInBits & 255;
 
-	// concatenate bits 11-8 to the channel.
+	// concatinate bits 11-8 to the channel.
 	msb_value |= (voltsInBits / 256);
-
-	printf("\n Output lsb_value %04x\n", lsb_value);
-	printf("\n Output msb_value %04x\n", msb_value);
 
 	out8(D_A_LSB_REGISTER, lsb_value);
 	out8(D_A_MSB_CHANNELNO_REGISTER, msb_value);
 
-	// Poll the DACBSY bit until the D to A conversion is done.
+	// Poll the DACBSY bit til the D to A conversion is done.
 	while (in8(A_D_INPUT_GAIN_REGISTER) & 0x08)
 		;
-
-	printf("\n Voltage set\n");
 }
 
 int main(int argc, char *argv[]) {
 
-	double results[NUMBEROFITERATIONS];
-	double stepInputValueVolts = 0;
-	double prevStepInputValueVolts = 0;
+	double road[NUMBEROFITERATIONS];
+	double wheel[NUMBEROFITERATIONS];
+
+	double inputValueV = 0;
+	double prevErrorValueV = 0;
+	double prevPrevErrorValueV = 0;
+	double resultsV = 0;
+	double prevResultsV = 0;
+	const double Kp = 1.35;
+	const double Ki = 0.06;
+	const double Kd = 0.01;
+	const double targetV = -5.0;
+	double errorV = 0;
 
 	int channelID = 0;
 	struct sigevent event; //Event to fire every 10ms
@@ -213,82 +219,70 @@ int main(int argc, char *argv[]) {
 	itime.it_interval.tv_nsec = 100000000;
 	timer_settime(timer_id, 0, &itime, NULL);
 
-	//A timer will exist to drive the register polling (10ms)
-	//The timer replaces the sleep command in this instance
-	pthread_mutex_t timimgMutex;
-	pthread_mutex_init(&timimgMutex, NULL);
-	pthread_mutex_lock(&timimgMutex);
-
 	if (!GetRootAccess()) {
 
 		SetupAtoD();
 		int k = 0;
 
-		while (true) {
-
-			if (k == NUMBEROFITERATIONS) {
-				MsgSendPulse(channelID, 10, _PULSE_CODE_MAXAVAIL, NULL);
-				continue;
-			}
+		while (k != NUMBEROFITERATIONS) {
 
 			rcvid = MsgReceive(channelID, &msg, sizeof(msg), NULL);
 			if (rcvid == 0) {
 				if (msg.pulse.code == RTC_COMPUTE) {
-					//Recompute the transfer function and modify local state
+					inputValueV = MeasureVoltageOnChannel(0);
+					wheel[k] = inputValueV;
+					errorV = targetV - inputValueV;
 
-					// Step 1 Determine the time-domain difference equation for the transfer function.
-					//  y(k+1) = y(k) - 0.632y(k-1) + 0.368 u(k) + 0.264 u(k - 1)
-
-					stepInputValueVolts = MeasureVoltageOnChannel(0);
+					// trying a look at errors.
 
 					// The first two iterations are special cases because we don't have
 					// any history
 					if (k == 0) {
-						// y(k+1) = 0.368 u(k);
-						results[k] = 0.368 * stepInputValueVolts;
+						// u(k) = (Kp + Ki + Kd) * e(k)
+						resultsV = (Kp + Ki + Kd) * errorV;
+						prevErrorValueV = errorV;
+						prevResultsV = resultsV;
 					} else if (k == 1) {
-						// y(k+1) = y(k) + 0.368 u(k) + 0.264 u(k - 1);
-						results[k] = results[k - 1] + 0.368
-								* stepInputValueVolts + 0.264
-								* prevStepInputValueVolts;
+						// u(k) = u(k - 1) + (Kp + Ki + Kd) * e(k) - (Kp - 2Kd) * e(k - 1)
+						resultsV = prevResultsV + (Kp + Ki + Kd) * errorV - (Kp
+								- 2 * Kd) * prevErrorValueV;
+						prevPrevErrorValueV = prevErrorValueV;
+						prevErrorValueV = errorV;
+						prevResultsV = resultsV;
 					} else {
-						//  y(k+1) = y(k) - 0.632y(k-1) + 0.368 u(k) + 0.264 u(k - 1)
-						results[k] = results[k - 1] - 0.632 * results[k - 2]
-								+ 0.368 * stepInputValueVolts + 0.264
-								* prevStepInputValueVolts;
+						// u(k) = u(k - 1) + (Kp + Ki + Kd) * e(k) - (Kp - 2Kd) * e(k - 1) + Kd * e(k - 2)
+						resultsV = prevResultsV + (Kp + Ki + Kd) * errorV - (Kp
+								- 2 * Kd) * prevErrorValueV + Kd
+								* prevPrevErrorValueV;
+						prevPrevErrorValueV = prevErrorValueV;
+						prevErrorValueV = errorV;
+						prevResultsV = resultsV;
 					}
-					prevStepInputValueVolts = stepInputValueVolts;
+
+					road[k] = resultsV;
 
 					// 3a. Run this calculation as a periodic task executing at a 10Hz period
-
-					SendVoltageOnChannel(0, results[k]);
-				}
-				if (msg.pulse.code == RTC_TERMINATE) {
-					//End the program
-					cout << "End the program.\n";
-
-					// 2b. Open a file in /tmp and write the output values to that file. Give the
-					//     file a .csv extension
-					ofstream outputFile;
-					outputFile.open("/tmp/example.csv");
-
-					for (int k = 0; k < NUMBEROFITERATIONS; ++k) {
-						outputFile << results[k] << ", ";
-					}
-
-					outputFile << endl;
-
-					outputFile.close();
-					exit(0);
-				}
-				if (msg.pulse.code == RTC_INTERNAL_EXIT) {
-					//Unknown, needs clarification
-					cout << "Death.\n";
+					SendVoltageOnChannel(0, resultsV);
 				}
 			}
 			//The number of iterations passed has increased by one
 			k++;
 		}
+
+		// 2b. Open a file in /tmp and write the output values to that file. Give the
+		//     file a .csv extension
+		ofstream outputFile;
+		outputFile.open("/tmp/example.csv");
+
+		for (int k = 0; k < NUMBEROFITERATIONS; ++k) {
+			outputFile << road[k] << ",";
+			outputFile << wheel[k] << ", ";
+			outputFile << endl;
+		}
+
+		outputFile.close();
+
+		return EXIT_SUCCESS;
 		// set the voltage back to 0.
 		SendVoltageOnChannel(0, 0);
 	}
